@@ -38,14 +38,16 @@ float viewportWidth = 0; // Width of viewport in world units
 // ============================================================================
 
 // Reset viewport to default configuration
+// Implemented as stated in the PDF: Phase 1 camera defaults match the PDF (screen corners ±1)
 void resetCamera() {
-    eyePosition = Vec3(0);
-    forwardDir = Vec3(0, 0, -1);
-    up = Vec3(0, 1, 0);
-    rightDir = Vec3(1, 0, 0);
-    focalLength = 10.0f;
-    viewportHeight = 10.0f;
-    viewportWidth = 0;
+    eyePosition = Vec3(0, 0, 1);      // 1 unit in front of the Z=0 screen
+    forwardDir  = Vec3(0, 0, -1);     // looks toward the screen
+    up          = Vec3(0, 1, 0);
+    rightDir    = Vec3(1, 0, 0);
+
+    focalLength     = 1.0f;           // screen at Z=0 from eye at Z=1
+    viewportHeight  = 2.0f;           // from -1 to 1
+    viewportWidth   = 2.0f;           // from -1 to 1
 }
 
 // Check if point is finite (not infinity)
@@ -116,6 +118,8 @@ void handleCommand(const string& line, vector<Illumination*>& illuminators,
         break;
     case 'f':  // Forward direction
         forwardDir = glm::vec3(values[0], values[1], values[2]); 
+        // Implemented as stated in the PDF: use the scene's screen width from f ... w (4th value)
+        if (values.size() > 3) viewportWidth = values[3];
         break;
     case 'a':  // Ambient light color
         ambientLight = Vec3(values[0], values[1], values[2]); 
@@ -185,12 +189,15 @@ int readScene(const string& filename, vector<Illumination*>& illuminators,
 // ============================================================================
 
 // Configure viewport coordinate system based on image dimensions
+// Implemented as stated in the PDF: only auto-compute width if it wasn't provided from 'f' command
 void configureViewport(int width, int height) {
     forwardDir = glm::normalize(forwardDir);
     up = glm::normalize(up);
     rightDir = glm::normalize(glm::cross(forwardDir, up));
     float aspect = (float)width / height;
-    viewportWidth = viewportHeight * aspect;
+    if (viewportWidth == 0.0f) {
+        viewportWidth = viewportHeight * aspect;
+    }
 }
 
 // Create ray from camera through pixel at (px, py)
@@ -274,12 +281,34 @@ Vec3 sampleColor(Primitive* obj, const Vec3& pt) {
     return obj->get_rgb();
 }
 
+// Returns 1.0 for bright tiles and 0.5 for dark tiles (planes only)
+// Implemented as stated in the PDF: checkerboard affects diffuse only, not ambient
+float checkerCoeff(Primitive* obj, const Vec3& pt) {
+    if (!dynamic_cast<Plane*>(obj)) return 1.0f;
+
+    const float tileSize = 0.5f;
+    float patternValue = 0;
+
+    if (pt.x < 0) patternValue += floor((0.5f - pt.x) / tileSize);
+    else          patternValue += floor(pt.x / tileSize);
+
+    if (pt.y < 0) patternValue += floor((0.5f - pt.y) / tileSize);
+    else          patternValue += floor(pt.y / tileSize);
+
+    patternValue = (patternValue * 0.5f) - int(patternValue * 0.5f);
+    patternValue *= 2.0f;
+
+    return (patternValue > 0.5f) ? 0.5f : 1.0f;
+}
+
 // Calculate Lambertian diffuse shading component
+// Implemented as stated in the PDF: checkerboard affects diffuse only
 glm::vec3 lambertianShading(Primitive* obj, const glm::vec3& pt, Illumination* illum, 
                             const glm::vec3& lightDirection) {
     glm::vec3 normal = glm::normalize(obj->get_normal(pt));
     float nDotL = glm::max(glm::dot(normal, lightDirection), 0.0f);
-    return sampleColor(obj, pt) * nDotL * illum->getColor();
+    Vec3 kd = obj->get_rgb() * checkerCoeff(obj, pt);
+    return kd * nDotL * illum->getColor();
 }
 
 // Calculate Phong specular highlight component
@@ -295,10 +324,11 @@ glm::vec3 phongHighlight(Primitive* obj, const glm::vec3& pt, const glm::vec3& e
 }
 
 // Calculate total illumination at point (ambient + diffuse + specular)
+// Implemented as stated in the PDF: ambient uses base color only (checkerboard does not affect ambient)
 Vec3 calculateIllumination(Primitive* obj, const Vec3& pt, const Vec3& eyePos, 
                            const Vec3& ambient, const std::vector<Illumination*>& illuminators, 
                            const std::vector<Primitive*>& objects) {
-    Vec3 finalColor = sampleColor(obj, pt) * ambient; 
+    Vec3 finalColor = obj->get_rgb() * ambient; 
     for (Illumination* illum : illuminators) {
         if (illum->isGlobalType()) continue;
         
@@ -371,20 +401,8 @@ static Vec3 handleRefraction(Primitive* obj, const Vec3& hitPoint, const RayCast
         refractedColor = traceRay(exitRay, objects, illuminators, ambient, bounceCount + 1);
     }
 
-    // Add specular highlights from all lights
-    Vec3 specular(0, 0, 0);
-    Vec3 viewDir = glm::normalize(ray.getOrigin() - hitPoint);
-    for (Illumination* illum : illuminators) {
-        if (illum->isGlobalType()) continue;
-        
-        Vec3 lightDirection;
-        float lightDistance;
-        if (!calculateLightDirection(illum, hitPoint, lightDirection, lightDistance)) continue;
-        
-        specular += calculateGlassSpecular(obj, hitPoint, normal, viewDir, illum, lightDirection, objects);
-    }
-    
-    return refractedColor + specular; 
+    // Implemented as stated in the PDF: transparent objects use refracted color only (ignore material lighting)
+    return refractedColor; 
 }
 
 // Recursive ray tracing: trace ray through scene and calculate color
