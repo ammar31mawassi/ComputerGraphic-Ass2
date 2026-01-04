@@ -37,14 +37,14 @@ endif
 
 # Source files for raytracer (only the new ones we need)
 RAYTRACER_SRC = src/main.cpp \
-                src/Object.cpp \
+                src/Primitive.cpp \
                 src/Sphere.cpp \
                 src/Plane.cpp \
-                src/Ray.cpp \
-                src/Intersection.cpp \
-                src/Ambient.cpp \
-                src/DirectionalLight.cpp \
-                src/SpotLight.cpp \
+                src/RayCast.cpp \
+                src/HitResult.cpp \
+                src/GlobalLight.cpp \
+                src/ParallelLight.cpp \
+                src/ConeLight.cpp \
                 src/stb_image_write.cpp
 
 RAYTRACER_OBJ = $(patsubst src/%.cpp, ${workspaceFolder}/bin/%.o, $(RAYTRACER_SRC))

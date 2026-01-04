@@ -7,103 +7,158 @@
 #include <limits>
 #include <algorithm>
 
-#include "Light.h"
-#include "Ambient.h"
-#include "SpotLight.h"
-#include "DirectionalLight.h"
-#include "Object.h"
+#include "Illumination.h"
+#include "GlobalLight.h"
+#include "ConeLight.h"
+#include "ParallelLight.h"
+#include "Primitive.h"
 #include "Sphere.h"
 #include "Plane.h"
-#include "Ray.h"
-#include "Intersection.h"
+#include "RayCast.h"
+#include "HitResult.h"
 
 #include "stb/stb_image_write.h"
 
 using namespace std;
 
-// Camera state variables
-Vec3 camPos;
-Vec3 viewDir;
-Vec3 upVec;
-Vec3 rightVec;
-float screenDistance = 0;
-float screenHeight = 0;
-float screenWidth = 0;
+// ============================================================================
+// GLOBAL STATE: Viewport/Camera Configuration
+// ============================================================================
 
-// Initialize camera state to defaults
-void initCameraState() {
-    camPos = Vec3(0);
-    viewDir = Vec3(0, 0, -1);
-    upVec = Vec3(0, 1, 0);
-    rightVec = Vec3(1, 0, 0);
-    screenDistance = 10.0f;
-    screenHeight = 10.0f;
-    screenWidth = 0;
+Vec3 eyePosition;      // Camera/eye position in world space
+Vec3 forwardDir;        // Forward direction vector (normalized)
+Vec3 up;                // Up direction vector (normalized)
+Vec3 rightDir;          // Right direction vector (normalized)
+float focalLength = 0;   // Distance from eye to viewport plane
+float viewportHeight = 0;// Height of viewport in world units
+float viewportWidth = 0; // Width of viewport in world units
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Reset viewport to default configuration
+void resetCamera() {
+    eyePosition = Vec3(0);
+    forwardDir = Vec3(0, 0, -1);
+    up = Vec3(0, 1, 0);
+    rightDir = Vec3(1, 0, 0);
+    focalLength = 10.0f;
+    viewportHeight = 10.0f;
+    viewportWidth = 0;
 }
 
-// Check if intersection point is invalid (infinity)
-static bool invalidIntersection(const Vec3& pt) {
-    return std::isinf(pt.x) || std::isinf(pt.y) || std::isinf(pt.z);
+// Check if point is finite (not infinity)
+static bool isFinitePoint(const Vec3& pt) {
+    return !(std::isinf(pt.x) || std::isinf(pt.y) || std::isinf(pt.z));
 }
 
-// Process a single line from scene file
-void processSceneLine(const string& line, vector<Light*>& lights, vector<Object*>& objects, Vec3& ambientColor) {
+// Forward declarations
+bool isOccluded(const Vec3& pt, const Vec3& lightDirection, const float lightDistance, 
+                const std::vector<Primitive*>& objects);
+
+// Calculate light direction and distance for a given light source
+// Returns true if light is valid (not blocked by cone angle), false otherwise
+static bool calculateLightDirection(Illumination* illum, const Vec3& pt, Vec3& outDirection, float& outDistance) {
+    if (illum->isConeType()) {
+        auto* cone = dynamic_cast<ConeLight*>(illum);
+        Vec3 toLight = cone->getPosition() - pt;
+        outDistance = glm::length(toLight);
+        outDirection = glm::normalize(toLight);
+        
+        // Check if point is within cone angle
+        Vec3 coneDirection = glm::normalize(cone->getDirection());
+        float cosAngle = glm::dot(-outDirection, coneDirection);
+        if (cosAngle < cone->getAngle()) return false;  // Outside cone
+    } else {
+        outDirection = glm::normalize(-illum->getDirection());
+        outDistance = std::numeric_limits<float>::infinity();
+    }
+    return true;
+}
+
+// Calculate specular highlight for glass surfaces
+static Vec3 calculateGlassSpecular(Primitive* obj, const Vec3& pt, const Vec3& normal, 
+                                   const Vec3& viewDir, Illumination* illum, 
+                                   const Vec3& lightDir, const std::vector<Primitive*>& objects) {
+    if (isOccluded(pt, lightDir, std::numeric_limits<float>::infinity(), objects)) {
+        return Vec3(0, 0, 0);
+    }
+    
+    Vec3 reflectionDir = glm::normalize(glm::reflect(-lightDir, normal));
+    float specularAngle = glm::max(glm::dot(reflectionDir, viewDir), 0.0f);
+    float specularPower = glm::pow(specularAngle, obj->get_shininess());
+    return Vec3(1, 1, 1) * specularPower * illum->getColor();
+}
+
+// ============================================================================
+// SCENE PARSING
+// ============================================================================
+
+// Parse and execute a single command from scene file
+void handleCommand(const string& line, vector<Illumination*>& illuminators, 
+                   vector<Primitive*>& objects, Vec3& ambientLight) {
     stringstream ss(line);
     char cmd;
     ss >> cmd;
-    vector<float> params;
-    float param;
-    while (ss >> param) params.push_back(param);
+    vector<float> values;
+    float val;
+    while (ss >> val) values.push_back(val);
 
     switch (cmd) {
-    case 'e': 
-        camPos = glm::vec3(params[0], params[1], params[2]); 
-        if (params.size() > 3) screenDistance = params[3]; 
+    case 'e':  // Eye position
+        eyePosition = glm::vec3(values[0], values[1], values[2]); 
+        if (values.size() > 3) focalLength = values[3]; 
         break;
-    case 'u': 
-        upVec = glm::vec3(params[0], params[1], params[2]); 
-        if (params.size() > 3) screenHeight = params[3]; 
+    case 'u':  // Up vector
+        up = glm::vec3(values[0], values[1], values[2]); 
+        if (values.size() > 3) viewportHeight = values[3]; 
         break;
-    case 'f': viewDir = glm::vec3(params[0], params[1], params[2]); break;
-    case 'a': ambientColor = Vec3(params[0], params[1], params[2]); break;
-    case 'd':
-        if(params[3] == 0.0f) lights.push_back(new Directional(glm::vec3(params[0], params[1], params[2])));
-        else lights.push_back(new Spotlight(glm::vec3(params[0], params[1], params[2])));
+    case 'f':  // Forward direction
+        forwardDir = glm::vec3(values[0], values[1], values[2]); 
         break;
-    case 'p':
-        for(Light* light : lights) {
-            if(light->is_spotlight()) {
-                auto* spot = dynamic_cast<Spotlight*>(light);
-                if(spot->get_angle() == -1.0f) {
-                   spot->set_angle(params[3]); 
-                   spot->set_point(glm::vec3(params[0], params[1], params[2])); 
+    case 'a':  // Ambient light color
+        ambientLight = Vec3(values[0], values[1], values[2]); 
+        break;
+    case 'd':  // Directional or cone light
+        if(values[3] == 0.0f) 
+            illuminators.push_back(new ParallelLight(glm::vec3(values[0], values[1], values[2])));
+        else 
+            illuminators.push_back(new ConeLight(glm::vec3(values[0], values[1], values[2])));
+        break;
+    case 'p':  // Cone light position and angle
+        for(Illumination* illum : illuminators) {
+            if(illum->isConeType()) {
+                auto* cone = dynamic_cast<ConeLight*>(illum);
+                if(cone->getAngle() == -1.0f) {
+                   cone->setAngle(values[3]); 
+                   cone->setPosition(glm::vec3(values[0], values[1], values[2])); 
                    break;
                 }
             }
         }
         break;
-    case 'i':
-        for(Light* light : lights) {
-            if(!light->is_ambient() && !light->isIntensitySet()){ 
-                light->set_intensity(params[0], params[1], params[2]); 
+    case 'i':  // Light intensity/color
+        for(Illumination* illum : illuminators) {
+            if(!illum->isGlobalType() && !illum->isColorSet()){ 
+                illum->setColor(values[0], values[1], values[2]); 
                 break; 
             }    
         }
         break;
-    case 'o': case 'r': case 't':
-        MaterialType matType;
-        if(cmd == 'o') matType = STANDARD; 
-        else if(cmd == 'r') matType = MIRROR; 
-        else matType = GLASS;
-        if(params[3] > 0) 
-            objects.push_back(new Sphere(glm::vec3(params[0], params[1], params[2]), params[3], matType));
-        else 
-            objects.push_back(new Plane(glm::vec3(params[0], params[1], params[2]), params[3], matType));
+    case 'o': case 'r': case 't':  // Object (standard/mirror/glass)
+        {
+            MaterialType matType = (cmd == 'o') ? STANDARD : (cmd == 'r') ? MIRROR : GLASS;
+            if(values[3] > 0) 
+                objects.push_back(new Sphere(glm::vec3(values[0], values[1], values[2]), values[3], matType));
+            else 
+                objects.push_back(new Plane(glm::vec3(values[0], values[1], values[2]), values[3], matType));
+        }
         break;
-    case 'c':
-        for(Object* obj : objects) {
+    case 'c':  // Color for object
+        for(Primitive* obj : objects) {
             if(!obj->is_rgb_set()) { 
-                obj->set_rgb(params[0], params[1], params[2], params[3]); 
+                obj->set_rgb(values[0], values[1], values[2], values[3]); 
                 break; 
             }
         }
@@ -112,229 +167,267 @@ void processSceneLine(const string& line, vector<Light*>& lights, vector<Object*
     }
 }
 
-// Load and parse scene file
-int loadSceneFile(const string& filename, vector<Light*>& lights, vector<Object*>& objects, Vec3& ambientColor) {
+// Read and parse entire scene file
+int readScene(const string& filename, vector<Illumination*>& illuminators, 
+              vector<Primitive*>& objects, Vec3& ambientLight) {
     ifstream file(filename);
     if (!file.is_open()) return -1;
     string line;
     while (getline(file, line)) {
         if (line.empty()) continue;
-        processSceneLine(line, lights, objects, ambientColor);
+        handleCommand(line, illuminators, objects, ambientLight);
     }
     return 0;
 }
 
-// Setup camera coordinate system
-void setupCamera(int width, int height) {
-    viewDir = glm::normalize(viewDir);
-    upVec = glm::normalize(upVec);
-    rightVec = glm::normalize(glm::cross(viewDir, upVec));
+// ============================================================================
+// CAMERA/VIEWPORT SETUP
+// ============================================================================
+
+// Configure viewport coordinate system based on image dimensions
+void configureViewport(int width, int height) {
+    forwardDir = glm::normalize(forwardDir);
+    up = glm::normalize(up);
+    rightDir = glm::normalize(glm::cross(forwardDir, up));
     float aspect = (float)width / height;
-    screenWidth = screenHeight * aspect;
+    viewportWidth = viewportHeight * aspect;
 }
 
-// Generate ray through pixel
-Ray createPixelRay(int px, int py, int width, int height) {
-    Vec3 screenCenter = camPos + (viewDir * screenDistance);
-    float u = (px + 0.5f) / width - 0.5f; 
-    float v = 0.5f - (py + 0.5f) / height; 
-    Vec3 pixelPos = screenCenter + (rightVec * (u * screenWidth)) + (upVec * (v * screenHeight));
-    Vec3 rayDir = glm::normalize(pixelPos - camPos);
-    return Ray(camPos, rayDir);
+// Create ray from camera through pixel at (px, py)
+RayCast generateRay(int px, int py, int width, int height) {
+    Vec3 viewportCenter = eyePosition + (forwardDir * focalLength);
+    float u = (px + 0.5f) / width - 0.5f;   // Normalized x coordinate [-0.5, 0.5]
+    float v = 0.5f - (py + 0.5f) / height;  // Normalized y coordinate [-0.5, 0.5]
+    Vec3 pixelLocation = viewportCenter + (rightDir * (u * viewportWidth)) + (up * (v * viewportHeight));
+    Vec3 rayDirection = glm::normalize(pixelLocation - eyePosition);
+    return RayCast(eyePosition, rayDirection);
 }
 
-// Find nearest intersection with scene objects
-static bool findNearestIntersection(const Ray& ray, const std::vector<Object*>& objects, const Vec3& origin, Object*& closestObj, Vec3& intersectionPt) {
-    float minDist = std::numeric_limits<float>::infinity();
-    closestObj = nullptr;
-    for (Object* obj : objects) {
-        Vec3 pt = obj->get_intersection(ray);
-        if (invalidIntersection(pt)) continue;
-        float dist = glm::length(pt - origin);
-        if (dist > 0.001f && dist < minDist) { 
-            minDist = dist; 
-            closestObj = obj; 
-            intersectionPt = pt; 
+// ============================================================================
+// RAY-OBJECT INTERSECTION
+// ============================================================================
+
+// Find closest intersection with scene objects
+static bool closestHit(const RayCast& ray, const std::vector<Primitive*>& objects, 
+                       const Vec3& rayOrigin, Primitive*& hitObject, Vec3& hitPoint) {
+    float closestDistance = std::numeric_limits<float>::infinity();
+    hitObject = nullptr;
+    for (Primitive* obj : objects) {
+        Vec3 intersection = obj->get_intersection(ray);
+        if (!isFinitePoint(intersection)) continue;
+        float distance = glm::length(intersection - rayOrigin);
+        if (distance > 0.001f && distance < closestDistance) { 
+            closestDistance = distance; 
+            hitObject = obj; 
+            hitPoint = intersection; 
         }
     }
-    return closestObj != nullptr;
+    return hitObject != nullptr;
 }
 
-// Check if point is in shadow from light
-bool checkShadow(const Vec3& pt, const Vec3& lightDir, const float lightDist, const std::vector<Object*>& objects) {
-    Ray shadowRay(pt + lightDir * 0.01f, lightDir); 
-    for (Object* obj : objects) {
-        Vec3 p = obj->get_intersection(shadowRay);
-        if (!invalidIntersection(p)) {
-            float dist = glm::length(p - pt);
-            if (dist < lightDist) return true; 
+// Check if point is occluded from light source (shadow test)
+bool isOccluded(const Vec3& pt, const Vec3& lightDirection, const float lightDistance, 
+                const std::vector<Primitive*>& objects) {
+    RayCast occlusionRay(pt + lightDirection * 0.01f, lightDirection); 
+    for (Primitive* obj : objects) {
+        Vec3 intersection = obj->get_intersection(occlusionRay);
+        if (isFinitePoint(intersection)) {
+            float distance = glm::length(intersection - pt);
+            if (distance < lightDistance) return true; 
         }
     }
     return false;
 }
 
-// Compute checkerboard pattern color for planes
-Vec3 computeCheckerboard(Vec3 baseColor, Vec3 pt, Vec3 n) {
+// ============================================================================
+// SHADING AND COLOR
+// ============================================================================
+
+// Sample checkerboard pattern for planes
+Vec3 samplePattern(Vec3 baseColor, Vec3 pt, Vec3 n) {
     const float tileSize = 0.5f;
-    float pattern = 0;
+    float patternValue = 0;
     
+    // Calculate pattern based on x and y coordinates
     if (pt.x < 0) {
-        pattern += floor((0.5 - pt.x) / tileSize);
+        patternValue += floor((0.5 - pt.x) / tileSize);
     } else {
-        pattern += floor(pt.x / tileSize);
+        patternValue += floor(pt.x / tileSize);
     }
     if (pt.y < 0) {
-        pattern += floor((0.5 - pt.y) / tileSize);
+        patternValue += floor((0.5 - pt.y) / tileSize);
     } else {
-        pattern += floor(pt.y / tileSize);
+        patternValue += floor(pt.y / tileSize);
     }
-    pattern = (pattern * 0.5) - int(pattern * 0.5);
-    pattern *= 2;
+    patternValue = (patternValue * 0.5) - int(patternValue * 0.5);
+    patternValue *= 2;
 
-    return (pattern > 0.5) ? (0.5f * baseColor) : baseColor;
+    // Return darker or lighter based on pattern
+    return (patternValue > 0.5) ? (0.5f * baseColor) : baseColor;
 }
 
-// Get object color (with checkerboard for planes)
-Vec3 getObjectColor(Object* obj, const Vec3& pt) {
+// Get object color (with checkerboard pattern for planes)
+Vec3 sampleColor(Primitive* obj, const Vec3& pt) {
     if (dynamic_cast<Plane*>(obj)) {
-        return computeCheckerboard(obj->get_rgb(), pt, obj->get_normal(pt));
+        return samplePattern(obj->get_rgb(), pt, obj->get_normal(pt));
     }
     return obj->get_rgb();
 }
 
-// Calculate diffuse lighting contribution
-glm::vec3 computeDiffuse(Object* obj, const glm::vec3& pt, Light* light, const glm::vec3& lightDir) {
-    glm::vec3 n = glm::normalize(obj->get_normal(pt));
-    float ndotl = glm::max(glm::dot(n, lightDir), 0.0f);
-    return getObjectColor(obj, pt) * ndotl * light->get_intensity();
+// Calculate Lambertian diffuse shading component
+glm::vec3 lambertianShading(Primitive* obj, const glm::vec3& pt, Illumination* illum, 
+                            const glm::vec3& lightDirection) {
+    glm::vec3 normal = glm::normalize(obj->get_normal(pt));
+    float nDotL = glm::max(glm::dot(normal, lightDirection), 0.0f);
+    return sampleColor(obj, pt) * nDotL * illum->getColor();
 }
 
-// Calculate specular lighting contribution
-glm::vec3 computeSpecular(Object* obj, const glm::vec3& pt, const glm::vec3& eyePos, Light* light, const glm::vec3& lightDir) {
-    glm::vec3 n = glm::normalize(obj->get_normal(pt));
-    glm::vec3 viewDir = glm::normalize(eyePos - pt);
-    glm::vec3 reflectDir = glm::normalize(glm::reflect(-lightDir, n));
-    float vdotr = glm::max(glm::dot(viewDir, reflectDir), 0.0f);
-    float specPower = glm::pow(vdotr, obj->get_shininess());
-    glm::vec3 specColor(0.7f, 0.7f, 0.7f);
-    return specColor * specPower * light->get_intensity();
+// Calculate Phong specular highlight component
+glm::vec3 phongHighlight(Primitive* obj, const glm::vec3& pt, const glm::vec3& eyePos, 
+                          Illumination* illum, const glm::vec3& lightDirection) {
+    glm::vec3 normal = glm::normalize(obj->get_normal(pt));
+    glm::vec3 viewDirection = glm::normalize(eyePos - pt);
+    glm::vec3 reflectionDirection = glm::normalize(glm::reflect(-lightDirection, normal));
+    float viewDotReflect = glm::max(glm::dot(viewDirection, reflectionDirection), 0.0f);
+    float specularPower = glm::pow(viewDotReflect, obj->get_shininess());
+    glm::vec3 specularColor(0.7f, 0.7f, 0.7f);
+    return specularColor * specularPower * illum->getColor();
 }
 
-// Compute total lighting at point
-Vec3 computeLighting(Object* obj, const Vec3& pt, const Vec3& eyePos, const Vec3& ambient, const std::vector<Light*>& lights, const std::vector<Object*>& objects) {
-    Vec3 color = getObjectColor(obj, pt) * ambient; 
-    for (Light* light : lights) {
-        if (light->is_ambient()) continue;
-        Vec3 lightDir;
-        float lightDist;
-        if (light->is_spotlight()) {
-            auto* spot = dynamic_cast<Spotlight*>(light);
-            Vec3 toLight = spot->get_point() - pt;
-            lightDist = glm::length(toLight);
-            lightDir = glm::normalize(toLight);
-            Vec3 spotDir = glm::normalize(spot->get_direction());
-            float cosAngle = glm::dot(-lightDir, spotDir);
-            if (cosAngle < spot->get_angle()) continue; 
-        } else {
-            lightDir = glm::normalize(-light->get_direction());
-            lightDist = std::numeric_limits<float>::infinity();
-        }
-        if (checkShadow(pt, lightDir, lightDist, objects)) continue;
-        color += computeDiffuse(obj, pt, light, lightDir);
-        color += computeSpecular(obj, pt, eyePos, light, lightDir);
+// Calculate total illumination at point (ambient + diffuse + specular)
+Vec3 calculateIllumination(Primitive* obj, const Vec3& pt, const Vec3& eyePos, 
+                           const Vec3& ambient, const std::vector<Illumination*>& illuminators, 
+                           const std::vector<Primitive*>& objects) {
+    Vec3 finalColor = sampleColor(obj, pt) * ambient; 
+    for (Illumination* illum : illuminators) {
+        if (illum->isGlobalType()) continue;
+        
+        Vec3 lightDirection;
+        float lightDistance;
+        if (!calculateLightDirection(illum, pt, lightDirection, lightDistance)) continue;
+        if (isOccluded(pt, lightDirection, lightDistance, objects)) continue;
+        
+        finalColor += lambertianShading(obj, pt, illum, lightDirection);
+        finalColor += phongHighlight(obj, pt, eyePos, illum, lightDirection);
     }
-    return color;
+    return finalColor;
 }
 
-// Recursive ray tracing
-Vec3 castRay(const Ray& ray, const std::vector<Object*>& objects, const std::vector<Light*>& lights, const Vec3& ambient, int recursionDepth) {
-    if (recursionDepth > 5) return Vec3(0,0,0); 
+// ============================================================================
+// RAY TRACING
+// ============================================================================
+
+// Forward declaration
+Vec3 traceRay(const RayCast& ray, const std::vector<Primitive*>& objects, 
+              const std::vector<Illumination*>& illuminators, const Vec3& ambient, int bounceCount);
+
+// Handle reflection: calculate reflected ray and trace recursively
+static Vec3 handleReflection(Primitive* obj, const Vec3& hitPoint, const RayCast& ray,
+                              const std::vector<Primitive*>& objects,
+                              const std::vector<Illumination*>& illuminators,
+                              const Vec3& ambient, int bounceCount) {
+    Vec3 normal = obj->get_normal(hitPoint);
+    Vec3 rayDirection = ray.getDirection();
+    Vec3 reflectionDirection = glm::reflect(rayDirection, normal);
+    RayCast reflectedRay(hitPoint + reflectionDirection * 0.001f, reflectionDirection);
+    return traceRay(reflectedRay, objects, illuminators, ambient, bounceCount + 1);
+}
+
+// Handle refraction: calculate refracted ray through glass and trace recursively
+static Vec3 handleRefraction(Primitive* obj, const Vec3& hitPoint, const RayCast& ray,
+                              const std::vector<Primitive*>& objects,
+                              const std::vector<Illumination*>& illuminators,
+                              const Vec3& ambient, int bounceCount) {
+    Vec3 normal = obj->get_normal(hitPoint);
+    Vec3 rayDirection = ray.getDirection();
     
-    Object* obj = nullptr;
-    Vec3 pt;
+    // Entering: Air (n1=1.0) to Glass (n2=1.5)
+    const float n1 = 1.0f, n2 = 1.5f; 
+    float eta = n1 / n2;
+    Vec3 refractedIn = glm::refract(rayDirection, normal, eta);
     
-    if (!findNearestIntersection(ray, objects, ray.get_startP(), obj, pt)) {
-        return Vec3(0,0,0);
+    // Total internal reflection: use reflection instead
+    if (glm::length(refractedIn) < 0.01f) {
+        refractedIn = glm::reflect(rayDirection, normal); 
+    }
+
+    // Find exit point by tracing through object
+    RayCast internalRay(hitPoint + refractedIn * 0.01f, refractedIn);
+    Vec3 exitPoint = obj->get_intersection(internalRay);
+    
+    Vec3 refractedColor(0, 0, 0);
+    
+    if (isFinitePoint(exitPoint)) {
+        // Exiting: Glass (n2=1.5) to Air (n1=1.0)
+        Vec3 exitNormal = obj->get_normal(exitPoint);
+        Vec3 exitNormalInv = -exitNormal;
+        
+        eta = n2 / n1;
+        Vec3 refractedOut = glm::refract(refractedIn, exitNormalInv, eta);
+        
+        if (glm::length(refractedOut) < 0.01f) refractedOut = refractedIn;
+
+        RayCast exitRay(exitPoint + refractedOut * 0.01f, refractedOut);
+        refractedColor = traceRay(exitRay, objects, illuminators, ambient, bounceCount + 1);
+    }
+
+    // Add specular highlights from all lights
+    Vec3 specular(0, 0, 0);
+    Vec3 viewDir = glm::normalize(ray.getOrigin() - hitPoint);
+    for (Illumination* illum : illuminators) {
+        if (illum->isGlobalType()) continue;
+        
+        Vec3 lightDirection;
+        float lightDistance;
+        if (!calculateLightDirection(illum, hitPoint, lightDirection, lightDistance)) continue;
+        
+        specular += calculateGlassSpecular(obj, hitPoint, normal, viewDir, illum, lightDirection, objects);
+    }
+    
+    return refractedColor + specular; 
+}
+
+// Recursive ray tracing: trace ray through scene and calculate color
+Vec3 traceRay(const RayCast& ray, const std::vector<Primitive*>& objects, 
+              const std::vector<Illumination*>& illuminators, const Vec3& ambient, int bounceCount) {
+    // Limit recursion depth to prevent infinite loops
+    if (bounceCount > 5) return Vec3(0, 0, 0); 
+    
+    Primitive* hitObject = nullptr;
+    Vec3 hitPoint;
+    
+    // Find closest intersection
+    if (!closestHit(ray, objects, ray.getOrigin(), hitObject, hitPoint)) {
+        return Vec3(0, 0, 0);  // No hit: return black
     }
 
     // Handle reflective surfaces
-    if (obj->is_reflective()) {
-        Vec3 n = obj->get_normal(pt);
-        Vec3 dir = ray.get_directionV();
-        Vec3 reflectDir = glm::reflect(dir, n);
-        Ray reflectedRay(pt + reflectDir * 0.001f, reflectDir);
-        return castRay(reflectedRay, objects, lights, ambient, recursionDepth + 1);
+    if (hitObject->is_reflective()) {
+        return handleReflection(hitObject, hitPoint, ray, objects, illuminators, ambient, bounceCount);
     }
 
     // Handle transparent surfaces (refraction)
-    if (obj->is_transparent()) {
-         Vec3 n = obj->get_normal(pt);
-         Vec3 dir = ray.get_directionV();
-         
-         // Entering: Air to Glass
-         float n1 = 1.0f, n2 = 1.5f; 
-         float eta = n1 / n2;
-         Vec3 refractedIn = glm::refract(dir, n, eta);
-         
-         if (glm::length(refractedIn) < 0.01f) {
-             refractedIn = glm::reflect(dir, n); 
-         }
-
-         // Find exit point
-         Ray internalRay(pt + refractedIn * 0.01f, refractedIn);
-         Vec3 exitPt = obj->get_intersection(internalRay);
-         
-         Vec3 refractedColor(0,0,0);
-         
-         if (!invalidIntersection(exitPt)) {
-             // Exiting: Glass to Air
-             Vec3 nExit = obj->get_normal(exitPt);
-             Vec3 nExitInv = -nExit;
-             
-             eta = n2 / n1;
-             Vec3 refractedOut = glm::refract(refractedIn, nExitInv, eta);
-             
-             if (glm::length(refractedOut) < 0.01f) refractedOut = refractedIn;
-
-             Ray exitRay(exitPt + refractedOut * 0.01f, refractedOut);
-             refractedColor = castRay(exitRay, objects, lights, ambient, recursionDepth + 1);
-         }
-
-         // Add specular highlights
-         Vec3 spec(0,0,0);
-         for (Light* light : lights) {
-             if (light->is_ambient()) continue;
-             
-             Vec3 lightDir;
-             if (light->is_spotlight()) {
-                 lightDir = glm::normalize(dynamic_cast<Spotlight*>(light)->get_point() - pt);
-             } else {
-                 lightDir = glm::normalize(-light->get_direction());
-             }
-
-             if (!checkShadow(pt, lightDir, std::numeric_limits<float>::infinity(), objects)) {
-                Vec3 reflectDir = glm::normalize(glm::reflect(-lightDir, n));
-                Vec3 viewDir = glm::normalize(ray.get_startP() - pt);
-                float specAngle = glm::max(glm::dot(reflectDir, viewDir), 0.0f);
-                float specPower = glm::pow(specAngle, obj->get_shininess());
-                spec += Vec3(1,1,1) * specPower * light->get_intensity(); 
-             }
-         }
-         
-         return refractedColor + spec; 
+    if (hitObject->is_transparent()) {
+        return handleRefraction(hitObject, hitPoint, ray, objects, illuminators, ambient, bounceCount);
     }
 
-    return computeLighting(obj, pt, ray.get_startP(), ambient, lights, objects);
+    // Standard material: calculate lighting
+    return calculateIllumination(hitObject, hitPoint, ray.getOrigin(), ambient, illuminators, objects);
 }
 
-// Save image to PNG file
-static bool writeImage(const std::string& filename, int width, int height, const std::vector<unsigned char>& pixels) {
+// ============================================================================
+// IMAGE OUTPUT
+// ============================================================================
+
+// Save image buffer to PNG file
+static bool savePNG(const std::string& filename, int width, int height, 
+                    const std::vector<unsigned char>& pixels) {
     int stride = width * 3;
     return stbi_write_png(filename.c_str(), width, height, 3, pixels.data(), stride) != 0;
 }
 
-// Extract filename from path and change extension to .png
-string getOutputFilename(const string& filepath) {
+// Build output file path from scene file path
+string buildOutputPath(const string& filepath) {
     size_t lastSlash = filepath.find_last_of("/\\");
     string filename = (lastSlash == string::npos) ? filepath : filepath.substr(lastSlash + 1);
     size_t lastDot = filename.find_last_of(".");
@@ -344,8 +437,75 @@ string getOutputFilename(const string& filepath) {
     return "results/" + filename + ".png";
 }
 
+// ============================================================================
+// RENDERING
+// ============================================================================
+
+// Render single scene to image buffer
+void renderImage(int width, int height, const std::vector<Primitive*>& objects,
+                 const std::vector<Illumination*>& illuminators, const Vec3& ambientLight,
+                 std::vector<unsigned char>& image) {
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            RayCast ray = generateRay(x, y, width, height);
+            Vec3 color = traceRay(ray, objects, illuminators, ambientLight, 0);
+            color = glm::clamp(color, Vec3(0.0f), Vec3(1.0f));
+            
+            int pixelIdx = 3 * (y * width + x);
+            image[pixelIdx]     = (unsigned char)(255 * color.x);
+            image[pixelIdx + 1] = (unsigned char)(255 * color.y);
+            image[pixelIdx + 2] = (unsigned char)(255 * color.z);
+        }
+    }
+}
+
+// Process single scene file: load, render, and save
+bool processScene(const string& filepath) {
+    cout << "--------------------------------------" << endl;
+    cout << "Processing: " << filepath << endl;
+    resetCamera(); 
+    
+    vector<Illumination*> illuminators;
+    vector<Primitive*> objects;
+    Vec3 ambientLight(0.0f, 0.0f, 0.0f);
+
+    // Load scene
+    if (readScene(filepath, illuminators, objects, ambientLight) != 0) {
+        cerr << "Failed to open: " << filepath << endl;
+        return false;
+    }
+
+    // Setup viewport
+    int width = 800, height = 800;
+    configureViewport(width, height);
+
+    // Render image
+    vector<unsigned char> image(3 * width * height, 0);
+    cout << "Rendering..." << endl;
+    renderImage(width, height, objects, illuminators, ambientLight, image);
+    
+    // Save image
+    string outputFile = buildOutputPath(filepath);
+    if (!savePNG(outputFile, width, height, image)) {
+        cerr << "Failed to write " << outputFile << endl;
+        return false;
+    }
+    cout << "Saved: " << outputFile << endl;
+
+    // Cleanup
+    for (Illumination* illum : illuminators) delete illum;
+    for (Primitive* obj : objects) delete obj;
+    
+    return true;
+}
+
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
+
 int main()
 {
+    // List of scene files to render
     vector<string> scenes = { 
         "res/scene1.txt", 
         "res/scene2.txt", 
@@ -358,49 +518,11 @@ int main()
         "res/scene51.txt"
     };
 
-    for (size_t idx = 0; idx < scenes.size(); ++idx) {
-        string filepath = scenes[idx];
-        cout << "--------------------------------------" << endl;
-        cout << "Processing: " << filepath << endl;
-        initCameraState(); 
-        
-        vector<Light*> lights;
-        vector<Object*> objects;
-        Vec3 ambient(0.0f, 0.0f, 0.0f);
-
-        if (loadSceneFile(filepath, lights, objects, ambient) != 0) {
-            cerr << "Failed to open: " << filepath << endl;
-            continue;
-        }
-
-        int width = 800, height = 800;
-        setupCamera(width, height);
-
-        vector<unsigned char> image(3 * width * height, 0);
-
-        cout << "Rendering..." << endl;
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                Ray ray = createPixelRay(x, y, width, height);
-                Vec3 color = castRay(ray, objects, lights, ambient, 0);
-                color = glm::clamp(color, Vec3(0.0f), Vec3(1.0f));
-                int pixelIdx = 3 * (y * width + x);
-                image[pixelIdx]     = (unsigned char)(255 * color.x);
-                image[pixelIdx + 1] = (unsigned char)(255 * color.y);
-                image[pixelIdx + 2] = (unsigned char)(255 * color.z);
-            }
-        }
-        
-        string outputFile = getOutputFilename(filepath);
-
-        if (!writeImage(outputFile, width, height, image)) 
-            cerr << "Failed to write " << outputFile << endl;
-        else 
-            cout << "Saved: " << outputFile << endl;
-
-        for (Light* light : lights) delete light;
-        for (Object* obj : objects) delete obj;
+    // Process each scene
+    for (const string& filepath : scenes) {
+        processScene(filepath);
     }
+    
     cout << "--------------------------------------" << endl;
     return 0;
 }
